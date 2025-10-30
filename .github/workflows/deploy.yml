@@ -172,8 +172,7 @@ jobs:
 
             aws ecr get-login-password --region us-east-1 | sudo docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}
             sudo docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}
-          EOF
-            
+          EOF   
       - name: Configure and start Docker service
         run: |
           # Write environment variables to .env
