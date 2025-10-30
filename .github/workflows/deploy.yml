@@ -169,45 +169,54 @@ jobs:
 
             # Systemd service for Docker
             sudo tee /etc/systemd/system/${{ env.CONTAINER_NAME }}.service > /dev/null <<SERVICE
-[Unit]
-Description=PrepyAI API Container
-After=network.target docker.service
-Requires=docker.service
+         #-------------------------#
+         # Start systemd service file for Docker container
+         #-------------------------#
+         sudo tee /etc/systemd/system/${CONTAINER_NAME}.service > /dev/null <<SERVICE
+         [Unit]
+         Description=PrepyAI API Container
+         After=network.target docker.service
+         Requires=docker.service
 
-[Service]
-Restart=always
-ExecStartPre=-/usr/bin/docker stop ${CONTAINER_NAME}
-ExecStartPre=-/usr/bin/docker rm ${CONTAINER_NAME}
-ExecStart=/usr/bin/docker run --rm --name ${CONTAINER_NAME} --env-file /home/ubuntu/.env -p 5000:5000 ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
-ExecStop=-/usr/bin/docker stop ${CONTAINER_NAME}
+         [Service]
+         Restart=always
+         ExecStartPre=-/usr/bin/docker stop ${CONTAINER_NAME}
+         ExecStartPre=-/usr/bin/docker rm ${CONTAINER_NAME}
+         ExecStart=/usr/bin/docker run --rm --name ${CONTAINER_NAME} --env-file /home/ubuntu/.env -p 5000:5000 ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+         ExecStop=-/usr/bin/docker stop ${CONTAINER_NAME}
+ 
+         [Install]
+         WantedBy=multi-user.target
+         SERVICE
 
-[Install]
-WantedBy=multi-user.target
-SERVICE
+        # Reload systemd, enable and restart the container service
+           sudo systemctl daemon-reload
+           sudo systemctl enable ${CONTAINER_NAME}
+           sudo systemctl restart ${CONTAINER_NAME}
 
-            sudo systemctl daemon-reload
-            sudo systemctl enable ${CONTAINER_NAME}
-            sudo systemctl restart ${CONTAINER_NAME}
+        #-------------------------#
+        # Nginx reverse proxy setup
+        #-------------------------#
+           sudo bash -c "cat > /etc/nginx/sites-available/${CONTAINER_NAME}" <<EOL
+           server {
+           listen 80;
+           server_name praveen.me;
 
-            # Nginx configuration
-            sudo bash -c 'cat > /etc/nginx/sites-available/${{ env.CONTAINER_NAME }}' <<EOL
-server {
-  listen 80;
-  server_name praveen.me;
+           location / {
+              proxy_pass http://localhost:5000;
+              proxy_set_header Host \$host;
+              proxy_set_header X-Real-IP \$remote_addr;
+              proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto \$scheme;
+              }
+              }
+              EOL
 
-  location / {
-    proxy_pass http://localhost:5000;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-  }
-}
-EOL
-            sudo rm -f /etc/nginx/sites-enabled/default
-            sudo ln -sf /etc/nginx/sites-available/${{ env.CONTAINER_NAME }} /etc/nginx/sites-enabled/
-            sudo nginx -t && sudo systemctl restart nginx
+              sudo rm -f /etc/nginx/sites-enabled/default
+              sudo ln -sf /etc/nginx/sites-available/${CONTAINER_NAME} /etc/nginx/sites-enabled/
+              sudo nginx -t && sudo systemctl restart nginx
 
-            # Certbot SSL setup
-            sudo certbot --nginx -d praveen.me --non-interactive --agree-tos -m praveen.work.cyber@gmail.com
-EOF
+              #-------------------------#
+              # Certbot SSL setup
+              #-------------------------#
+              sudo certbot --nginx -d praveen.me --non-interactive --agree-tos -m praveen.work.cyber@gmail.com
