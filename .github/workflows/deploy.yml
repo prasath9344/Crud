@@ -3,8 +3,9 @@ name: Deploy PrepyAI-API Docker App to AWS EC2
 on:
   workflow_dispatch:
     inputs:
-      name:
-        description: "Deploy the PrepyAI-API from Dev"
+      environment:
+        description: "Environment to deploy (e.g., dev, prod)"
+        required: false
         default: "dev"
 
 permissions:
@@ -30,47 +31,39 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+
+      # Checkout source
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Install JQ for JSON parsing
       - name: Install jq
         run: sudo apt-get install -y jq
 
+      # Configure AWS credentials using OIDC
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          audience: sts.amazonaws.com
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: arn:aws:iam::934484537298:role/crud-api
 
-      # ---------- SECURITY GROUP ----------
-      - name: Check if Security Group Exists
-        id: check-security-group
+      # Check/Create Security Group
+      - name: Check/Create Security Group
+        id: security-group
         run: |
           SECURITY_GROUP_ID=$(aws ec2 describe-security-groups \
             --filters Name=group-name,Values=${{ env.SECURITY_GROUP_NAME }} \
-            --query 'SecurityGroups[0].GroupId' \
-            --output text)
-
-          if [ "$SECURITY_GROUP_ID" == "None" ]; then
-            echo "security_group_exists=false" >> $GITHUB_ENV
-          else
-            echo "security_group_exists=true" >> $GITHUB_ENV
-            echo "security_group_id=$SECURITY_GROUP_ID" >> $GITHUB_ENV
+            --query 'SecurityGroups[0].GroupId' --output text)
+          if [[ "$SECURITY_GROUP_ID" == "None" ]]; then
+            SECURITY_GROUP_ID=$(aws ec2 create-security-group \
+              --group-name ${{ env.SECURITY_GROUP_NAME }} \
+              --description "${{ env.SECURITY_GROUP_DESCRIPTION }}" \
+              --vpc-id ${{ env.VPC_ID }} --query 'GroupId' --output text)
           fi
+          echo "SECURITY_GROUP_ID=$SECURITY_GROUP_ID" >> $GITHUB_ENV
 
-      - name: Create Security Group
-        if: env.security_group_exists == 'false'
-        run: |
-          SECURITY_GROUP_ID=$(aws ec2 create-security-group \
-            --group-name ${{ env.SECURITY_GROUP_NAME }} \
-            --description "${{ env.SECURITY_GROUP_DESCRIPTION }}" \
-            --vpc-id ${{ env.VPC_ID }} \
-            --query 'GroupId' \
-            --output text)
-          echo "security_group_id=$SECURITY_GROUP_ID" >> $GITHUB_ENV
-
-      - name: Authorize Security Group Ingress Rules
+      # Authorize ingress rules
+      - name: Authorize Ingress
         run: |
           RULES='[
             {"IpProtocol":"tcp","FromPort":22,"ToPort":22,"CidrIp":"0.0.0.0/0"},
@@ -83,152 +76,138 @@ jobs:
             FROM_PORT=$(echo "$RULE" | jq -r '.FromPort')
             TO_PORT=$(echo "$RULE" | jq -r '.ToPort')
             CIDR_IP=$(echo "$RULE" | jq -r '.CidrIp')
-
             EXISTING_RULE=$(aws ec2 describe-security-group-rules \
-              --filters Name=group-id,Values=${{ env.security_group_id }} \
-              --query 'SecurityGroupRules[?FromPort==`'$FROM_PORT'` && ToPort==`'$TO_PORT'` && IpProtocol==`'$PROTOCOL'` && CidrIpv4==`'$CIDR_IP'`]' \
+              --filters Name=group-id,Values=${{ env.SECURITY_GROUP_ID }} \
+              --query "SecurityGroupRules[?FromPort==\`$FROM_PORT\` && ToPort==\`$TO_PORT\` && IpProtocol==\`$PROTOCOL\` && CidrIpv4==\`$CIDR_IP\`]" \
               --output text)
-
-            if [ "$EXISTING_RULE" == "" ]; then
+            if [[ -z "$EXISTING_RULE" ]]; then
               aws ec2 authorize-security-group-ingress \
-                --group-id ${{ env.security_group_id }} \
-                --protocol $PROTOCOL \
-                --port $FROM_PORT-$TO_PORT \
-                --cidr $CIDR_IP
+                --group-id ${{ env.SECURITY_GROUP_ID }} \
+                --protocol $PROTOCOL --port $FROM_PORT-$TO_PORT --cidr $CIDR_IP
             fi
           done
 
-      # ---------- EC2 INSTANCE ----------
-      - name: Check if EC2 Instance Exists
-        id: check-instance
+      # Check/Create EC2 Instance
+      - name: Check/Create EC2 Instance
+        id: ec2-instance
         run: |
           INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=${{ env.INSTANCE_NAME }}" "Name=instance-state-name,Values=running" \
+            --filters "Name=tag:Name,Values=${{ env.INSTANCE_NAME }}" \
+            "Name=instance-state-name,Values=running" \
             --query 'Reservations[0].Instances[0].InstanceId' \
             --output text)
-
-          if [ "$INSTANCE_ID" == "None" ]; then
-            echo "instance_exists=false" >> $GITHUB_ENV
-          else
-            echo "instance_exists=true" >> $GITHUB_ENV
-            echo "instance_id=$INSTANCE_ID" >> $GITHUB_ENV
+          if [[ "$INSTANCE_ID" == "None" ]]; then
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id ${{ env.AMI_ID }} --count 1 --instance-type ${{ env.INSTANCE_TYPE }} \
+              --key-name ${{ env.KEY_NAME }} \
+              --network-interfaces '[{"AssociatePublicIpAddress":true,"DeviceIndex":0,"Groups":["${{ env.SECURITY_GROUP_ID }}"]}]' \
+              --iam-instance-profile Name=${{ env.ECR_ROLE_NAME }} \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ env.INSTANCE_NAME }} }]" \
+              --query 'Instances[0].InstanceId' --output text)
           fi
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
 
-      - name: Create EC2 Instance (if not exists)
-        if: env.instance_exists == 'false'
-        run: |
-          INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id ${{ env.AMI_ID }} \
-            --count 1 \
-            --instance-type ${{ env.INSTANCE_TYPE }} \
-            --key-name ${{ env.KEY_NAME }} \
-            --network-interfaces '[{"AssociatePublicIpAddress":true,"DeviceIndex":0,"Groups":["${{ env.security_group_id }}"]}]' \
-            --iam-instance-profile Name=${{ env.ECR_ROLE_NAME }} \
-            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=${{ env.INSTANCE_NAME }}}]' \
-            --query 'Instances[0].InstanceId' \
-            --output text)
-          echo "instance_id=$INSTANCE_ID" >> $GITHUB_ENV
+      # Wait for instance to be running
+      - name: Wait for EC2 Instance to be running
+        run: aws ec2 wait instance-running --instance-ids ${{ env.INSTANCE_ID }}
 
-      - name: Wait for EC2 Instance to be Running
-        run: aws ec2 wait instance-running --instance-ids ${{ env.instance_id }}
-
-      - name: Get Public IP of EC2 Instance
-        id: get-ip
+      # Fetch EC2 public IP
+      - name: Get EC2 Public IP
+        id: get-public-ip
         run: |
           PUBLIC_IP=$(aws ec2 describe-instances \
-            --instance-ids ${{ env.instance_id }} \
-            --query 'Reservations[0].Instances[0].PublicIpAddress' \
-            --output text)
-          echo "public_ip=$PUBLIC_IP" >> $GITHUB_ENV
+            --instance-ids ${{ env.INSTANCE_ID }} \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
 
-      # ---------- ECR & DEPLOY ----------
+      # Login to ECR
       - name: Login to Amazon ECR
-        id: login-ecr
+        id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image
+      # Build and push Docker image
+      - name: Build, Tag, and Push Docker Image
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG} .
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}
 
-      - name: Get SSH Key
+      # Copy SSH key
+      - name: Prepare SSH Key
         run: |
           echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > private_key.pem
           chmod 600 private_key.pem
 
-      - name: Deploy to EC2
+      # Setup EC2: Docker, Nginx, and Deploy Container
+      - name: Deploy Container to EC2
+        env:
+          PUBLIC_IP: ${{ env.PUBLIC_IP }}
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          IMAGE_TAG="${{ github.sha }}"
-          ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@${{ env.public_ip }} << 'EOF'
+          ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@${{ env.PUBLIC_IP }} << EOF
+            # Prerequisites
             sudo apt-get update -y
             sudo apt-get install -y gnupg ca-certificates curl unzip lsb-release nginx certbot python3-certbot-nginx
-            sudo curl -fsSL https://get.docker.com -o get-docker.sh
+            curl -fsSL https://get.docker.com -o get-docker.sh
             sudo sh get-docker.sh
             sudo usermod -aG docker ubuntu
             sudo systemctl enable docker --now
 
-            aws ecr get-login-password --region us-east-1 | sudo docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}
-            sudo docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}
-          EOF   
-      - name: Configure and start Docker service
-        run: |
-          # Write environment variables to .env
-          echo "DB_USER=${{ secrets.DB_USER }}" | sudo tee /home/ubuntu/.env
-          echo "DB_HOST=${{ secrets.DB_HOST }}" | sudo tee -a /home/ubuntu/.env
-          echo "DB_NAME=${{ secrets.DB_NAME }}" | sudo tee -a /home/ubuntu/.env
-          echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" | sudo tee -a /home/ubuntu/.env
+            # Docker/ECR login
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | sudo docker login --username AWS --password-stdin ${{ steps.ecr-login.outputs.registry }}
 
-          # Create systemd service for container
-          sudo tee /etc/systemd/system/${{ env.CONTAINER_NAME }}.service > /dev/null << 'SERVICE'
-          [Unit]
-          Description=PrepyAI API Container
-          After=network.target docker.service
-          Requires=docker.service
+            # Pull Docker image and create .env file
+            sudo docker pull ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            echo "DB_USER=${{ secrets.DB_USER }}" | sudo tee /home/ubuntu/.env
+            echo "DB_HOST=${{ secrets.DB_HOST }}" | sudo tee -a /home/ubuntu/.env
+            echo "DB_NAME=${{ secrets.DB_NAME }}" | sudo tee -a /home/ubuntu/.env
+            echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" | sudo tee -a /home/ubuntu/.env
 
-          [Service]
-          Restart=always
-          ExecStartPre=-/usr/bin/docker stop {{CONTAINER_NAME}}
-          ExecStartPre=-/usr/bin/docker rm {{CONTAINER_NAME}}
-          ExecStart=/usr/bin/docker run --rm --name {{CONTAINER_NAME}} --env-file /home/ubuntu/.env -p 5000:5000 {{REGISTRY}}/{{REPOSITORY}}:{{TAG}}
-          ExecStop=-/usr/bin/docker stop {{CONTAINER_NAME}}
+            # Systemd service for Docker
+            sudo tee /etc/systemd/system/${{ env.CONTAINER_NAME }}.service > /dev/null <<SERVICE
+[Unit]
+Description=PrepyAI API Container
+After=network.target docker.service
+Requires=docker.service
 
-         [Install]
-         WantedBy=multi-user.target
-         SERVICE
+[Service]
+Restart=always
+ExecStartPre=-/usr/bin/docker stop ${CONTAINER_NAME}
+ExecStartPre=-/usr/bin/docker rm ${CONTAINER_NAME}
+ExecStart=/usr/bin/docker run --rm --name ${CONTAINER_NAME} --env-file /home/ubuntu/.env -p 5000:5000 ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+ExecStop=-/usr/bin/docker stop ${CONTAINER_NAME}
 
-         # Replace placeholders with environment values
-         sudo sed -i "s|{{CONTAINER_NAME}}|${{ env.CONTAINER_NAME }}|g" /etc/systemd/system/${{ env.CONTAINER_NAME }}.service
-         sudo sed -i "s|{{REGISTRY}}|${{ steps.login-ecr.outputs.registry }}|g" /etc/systemd/system/${{ env.CONTAINER_NAME }}.service
-         sudo sed -i "s|{{REPOSITORY}}|${{ env.ECR_REPOSITORY }}|g" /etc/systemd/system/${{ env.CONTAINER_NAME }}.service
-         sudo sed -i "s|{{TAG}}|${{ env.IMAGE_TAG }}|g" /etc/systemd/system/${{ env.CONTAINER_NAME }}.service
+[Install]
+WantedBy=multi-user.target
+SERVICE
 
-         # Enable and restart the service
-         sudo systemctl daemon-reload
-         sudo systemctl enable ${{ env.CONTAINER_NAME }}
-         sudo systemctl restart ${{ env.CONTAINER_NAME }}
+            sudo systemctl daemon-reload
+            sudo systemctl enable ${CONTAINER_NAME}
+            sudo systemctl restart ${CONTAINER_NAME}
 
-         # Setup Nginx reverse proxy
-         sudo bash -c "cat > /etc/nginx/sites-available/${{ env.CONTAINER_NAME }}" << 'EOL'
-         server {
-         listen 80;
-         server_name praveen.me;
+            # Nginx configuration
+            sudo bash -c 'cat > /etc/nginx/sites-available/${{ env.CONTAINER_NAME }}' <<EOL
+server {
+  listen 80;
+  server_name praveen.me;
 
-         location / {
-            proxy_pass http://localhost:5000;
-            proxy_set_header Host \$host;
-            proxy_set_header X-Real-IP \$remote_addr;
-            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto \$scheme;
-         }
-         }
-         EOL
+  location / {
+    proxy_pass http://localhost:5000;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+  }
+}
+EOL
+            sudo rm -f /etc/nginx/sites-enabled/default
+            sudo ln -sf /etc/nginx/sites-available/${{ env.CONTAINER_NAME }} /etc/nginx/sites-enabled/
+            sudo nginx -t && sudo systemctl restart nginx
 
-         sudo rm -f /etc/nginx/sites-enabled/default
-         sudo ln -sf /etc/nginx/sites-available/${{ env.CONTAINER_NAME }} /etc/nginx/sites-enabled/
-         sudo nginx -t && sudo systemctl restart nginx
-
-         # Enable SSL with Certbot
-         sudo certbot --nginx -d praveen.me --non-interactive --agree-tos -m praveen.work.cyber@gmail.com
+            # Certbot SSL setup
+            sudo certbot --nginx -d praveen.me --non-interactive --agree-tos -m praveen.work.cyber@gmail.com
+EOF
