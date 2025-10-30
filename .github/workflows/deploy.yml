@@ -1,4 +1,4 @@
-  name: Deploy PrepyAI-API Docker App to AWS EC2
+name: Deploy PrepyAI-API Docker App to AWS EC2
 
 on:
   workflow_dispatch:
