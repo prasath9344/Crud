@@ -18,3 +18,4 @@ EXPOSE 5000
 
 # Default command to run your Python app
 CMD ["python", "app.py"]
+    
