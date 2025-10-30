@@ -173,50 +173,62 @@ jobs:
             aws ecr get-login-password --region us-east-1 | sudo docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}
             sudo docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}
 
-            echo "DB_USER=${{ secrets.DB_USER }}" | sudo tee /home/ubuntu/.env
-            echo "DB_HOST=${{ secrets.DB_HOST }}" | sudo tee -a /home/ubuntu/.env
-            echo "DB_NAME=${{ secrets.DB_NAME }}" | sudo tee -a /home/ubuntu/.env
-            echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" | sudo tee -a /home/ubuntu/.env
+      - name: Configure and start Docker service
+        run: |
+          # Write environment variables to .env
+          echo "DB_USER=${{ secrets.DB_USER }}" | sudo tee /home/ubuntu/.env
+          echo "DB_HOST=${{ secrets.DB_HOST }}" | sudo tee -a /home/ubuntu/.env
+          echo "DB_NAME=${{ secrets.DB_NAME }}" | sudo tee -a /home/ubuntu/.env
+          echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" | sudo tee -a /home/ubuntu/.env
 
-            sudo tee /etc/systemd/system/${{ env.CONTAINER_NAME }}.service > /dev/null << SERVICE
-[Unit]
-Description=PrepyAI API Container
-After=network.target docker.service
-Requires=docker.service
+          # Create systemd service for container
+          sudo tee /etc/systemd/system/${{ env.CONTAINER_NAME }}.service > /dev/null << 'SERVICE'
+          [Unit]
+          Description=PrepyAI API Container
+          After=network.target docker.service
+          Requires=docker.service
 
-[Service]
-Restart=always
-ExecStartPre=-/usr/bin/docker stop ${{ env.CONTAINER_NAME }}
-ExecStartPre=-/usr/bin/docker rm ${{ env.CONTAINER_NAME }}
-ExecStart=/usr/bin/docker run --rm --name ${{ env.CONTAINER_NAME }} --env-file /home/ubuntu/.env -p 5000:5000 ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}
-ExecStop=/usr/bin/docker stop ${{ env.CONTAINER_NAME }}
+          [Service]
+          Restart=always
+          ExecStartPre=-/usr/bin/docker stop {{CONTAINER_NAME}}
+          ExecStartPre=-/usr/bin/docker rm {{CONTAINER_NAME}}
+          ExecStart=/usr/bin/docker run --rm --name {{CONTAINER_NAME}} --env-file /home/ubuntu/.env -p 5000:5000 {{REGISTRY}}/{{REPOSITORY}}:{{TAG}}
+          ExecStop=-/usr/bin/docker stop {{CONTAINER_NAME}}
 
-[Install]
-WantedBy=multi-user.target
-SERVICE
+         [Install]
+         WantedBy=multi-user.target
+         SERVICE
 
-            sudo systemctl daemon-reload
-            sudo systemctl enable ${{ env.CONTAINER_NAME }}
-            sudo systemctl restart ${{ env.CONTAINER_NAME }}
+         # Replace placeholders with environment values
+         sudo sed -i "s|{{CONTAINER_NAME}}|${{ env.CONTAINER_NAME }}|g" /etc/systemd/system/${{ env.CONTAINER_NAME }}.service
+         sudo sed -i "s|{{REGISTRY}}|${{ steps.login-ecr.outputs.registry }}|g" /etc/systemd/system/${{ env.CONTAINER_NAME }}.service
+         sudo sed -i "s|{{REPOSITORY}}|${{ env.ECR_REPOSITORY }}|g" /etc/systemd/system/${{ env.CONTAINER_NAME }}.service
+         sudo sed -i "s|{{TAG}}|${{ env.IMAGE_TAG }}|g" /etc/systemd/system/${{ env.CONTAINER_NAME }}.service
 
-            # Nginx reverse proxy
-            sudo bash -c "cat > /etc/nginx/sites-available/${{ env.CONTAINER_NAME }}" <<'EOL'
-server {
-    listen 80;
-    server_name praveen.me;
+         # Enable and restart the service
+         sudo systemctl daemon-reload
+         sudo systemctl enable ${{ env.CONTAINER_NAME }}
+         sudo systemctl restart ${{ env.CONTAINER_NAME }}
 
-    location / {
-        proxy_pass http://localhost:5000;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-EOL
+         # Setup Nginx reverse proxy
+         sudo bash -c "cat > /etc/nginx/sites-available/${{ env.CONTAINER_NAME }}" << 'EOL'
+         server {
+         listen 80;
+         server_name praveen.me;
 
-            sudo rm /etc/nginx/sites-enabled/default
-            sudo ln -s /etc/nginx/sites-available/${{ env.CONTAINER_NAME }} /etc/nginx/sites-enabled/
-            sudo nginx -t && sudo systemctl restart nginx
-            sudo certbot --nginx -d praveen.me --non-interactive --agree-tos -m praveen.work.cyber@gmail.com
-          EOF
+         location / {
+            proxy_pass http://localhost:5000;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+         }
+         }
+         EOL
+
+         sudo rm -f /etc/nginx/sites-enabled/default
+         sudo ln -sf /etc/nginx/sites-available/${{ env.CONTAINER_NAME }} /etc/nginx/sites-enabled/
+         sudo nginx -t && sudo systemctl restart nginx
+
+         # Enable SSL with Certbot
+         sudo certbot --nginx -d praveen.me --non-interactive --agree-tos -m praveen.work.cyber@gmail.com
