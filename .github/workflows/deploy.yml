@@ -31,23 +31,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
-      # Checkout source
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Install JQ for JSON parsing
       - name: Install jq
         run: sudo apt-get install -y jq
 
-      # Configure AWS credentials using OIDC
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.AWS_REGION }}
           role-to-assume: arn:aws:iam::934484537298:role/crud-api
 
-      # Check/Create Security Group
       - name: Check/Create Security Group
         id: security-group
         run: |
@@ -62,7 +57,6 @@ jobs:
           fi
           echo "SECURITY_GROUP_ID=$SECURITY_GROUP_ID" >> $GITHUB_ENV
 
-      # Authorize ingress rules
       - name: Authorize Ingress
         run: |
           RULES='[
@@ -87,7 +81,6 @@ jobs:
             fi
           done
 
-      # Check/Create EC2 Instance
       - name: Check/Create EC2 Instance
         id: ec2-instance
         run: |
@@ -107,11 +100,9 @@ jobs:
           fi
           echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
 
-      # Wait for instance to be running
       - name: Wait for EC2 Instance to be running
         run: aws ec2 wait instance-running --instance-ids ${{ env.INSTANCE_ID }}
 
-      # Fetch EC2 public IP
       - name: Get EC2 Public IP
         id: get-public-ip
         run: |
@@ -120,12 +111,10 @@ jobs:
             --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
           echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
 
-      # Login to ECR
       - name: Login to Amazon ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Build and push Docker image
       - name: Build, Tag, and Push Docker Image
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
@@ -134,11 +123,11 @@ jobs:
           docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG} .
           docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}
 
-      # Copy SSH key
       - name: Prepare SSH Key
         run: |
           echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > private_key.pem
           chmod 600 private_key.pem
+
       - name: Deploy Container to EC2
         env:
           PUBLIC_IP: ${{ env.PUBLIC_IP }}
@@ -146,8 +135,8 @@ jobs:
           ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@${{ env.PUBLIC_IP }} << EOF
-            # Prerequisites
+          ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@${{ env.PUBLIC_IP }} << 'EOF'
+
             sudo apt-get update -y
             sudo apt-get install -y gnupg ca-certificates curl unzip lsb-release nginx certbot python3-certbot-nginx
             curl -fsSL https://get.docker.com -o get-docker.sh
@@ -155,66 +144,55 @@ jobs:
             sudo usermod -aG docker ubuntu
             sudo systemctl enable docker --now
 
-            # Docker/ECR login
             aws ecr get-login-password --region ${{ env.AWS_REGION }} | sudo docker login --username AWS --password-stdin ${{ steps.ecr-login.outputs.registry }}
 
-            # Pull Docker image and create .env file
-            sudo docker pull ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            sudo docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
             echo "DB_USER=${{ secrets.DB_USER }}" | sudo tee /home/ubuntu/.env
             echo "DB_HOST=${{ secrets.DB_HOST }}" | sudo tee -a /home/ubuntu/.env
             echo "DB_NAME=${{ secrets.DB_NAME }}" | sudo tee -a /home/ubuntu/.env
             echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" | sudo tee -a /home/ubuntu/.env
 
-            # Systemd service for Docker
             sudo tee /etc/systemd/system/${{ env.CONTAINER_NAME }}.service > /dev/null <<SERVICE
-         #-------------------------#
-         # Start systemd service file for Docker container
-         #-------------------------#
-         sudo tee /etc/systemd/system/${CONTAINER_NAME}.service > /dev/null <<SERVICE
-         [Unit]
-         Description=PrepyAI API Container
-         After=network.target docker.service
-         Requires=docker.service
+[Unit]
+Description=PrepyAI API Container
+After=network.target docker.service
+Requires=docker.service
 
-         [Service]
-         Restart=always
-         ExecStartPre=-/usr/bin/docker stop ${CONTAINER_NAME}
-         ExecStartPre=-/usr/bin/docker rm ${CONTAINER_NAME}
-         ExecStart=/usr/bin/docker run --rm --name ${CONTAINER_NAME} --env-file /home/ubuntu/.env -p 5000:5000 ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
-         ExecStop=-/usr/bin/docker stop ${CONTAINER_NAME}
- 
-         [Install]
-         WantedBy=multi-user.target
-         SERVICE
+[Service]
+Restart=always
+ExecStartPre=-/usr/bin/docker stop ${{ env.CONTAINER_NAME }}
+ExecStartPre=-/usr/bin/docker rm ${{ env.CONTAINER_NAME }}
+ExecStart=/usr/bin/docker run --rm --name ${{ env.CONTAINER_NAME }} --env-file /home/ubuntu/.env -p 5000:5000 $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+ExecStop=-/usr/bin/docker stop ${{ env.CONTAINER_NAME }}
 
-        # Reload systemd, enable and restart the container service
-           sudo systemctl daemon-reload
-           sudo systemctl enable ${CONTAINER_NAME}
-           sudo systemctl restart ${CONTAINER_NAME}
+[Install]
+WantedBy=multi-user.target
+SERVICE
 
-        #-------------------------#
-        # Nginx reverse proxy setup
-        #-------------------------#
-           sudo bash -c "cat > /etc/nginx/sites-available/${CONTAINER_NAME}" <<EOL
-           server {
-           listen 80;
-           server_name praveen.me;
+            sudo systemctl daemon-reload
+            sudo systemctl enable ${{ env.CONTAINER_NAME }}
+            sudo systemctl restart ${{ env.CONTAINER_NAME }}
 
-           location / {
-              proxy_pass http://localhost:5000;
-              proxy_set_header Host \$host;
-              proxy_set_header X-Real-IP \$remote_addr;
-              proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-              proxy_set_header X-Forwarded-Proto \$scheme;
-              }
-              }
-              EOL
+            sudo bash -c "cat > /etc/nginx/sites-available/${{ env.CONTAINER_NAME }}" <<EOL
+server {
+    listen 80;
+    server_name praveen.me;
 
-              sudo rm -f /etc/nginx/sites-enabled/default
-              sudo ln -sf /etc/nginx/sites-available/${CONTAINER_NAME} /etc/nginx/sites-enabled/
-              sudo nginx -t && sudo systemctl restart nginx
+    location / {
+        proxy_pass http://localhost:5000;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOL
 
-              #-------------------------#
-              # Certbot SSL setup
-              #-------------------------#
-              sudo certbot --nginx -d praveen.me --non-interactive --agree-tos -m praveen.work.cyber@gmail.com
+            sudo rm -f /etc/nginx/sites-enabled/default
+            sudo ln -sf /etc/nginx/sites-available/${{ env.CONTAINER_NAME }} /etc/nginx/sites-enabled/
+            sudo nginx -t && sudo systemctl restart nginx
+
+            sudo certbot --nginx -d praveen.me --non-interactive --agree-tos -m praveen.work.cyber@gmail.com
+          EOF
+
